@@ -1,0 +1,683 @@
+#include <pthread.h>
+#include <stdio.h>
+#include "header.h"
+
+//static std::vector<Stream_Item> _s_threads;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::deque<AVPacket*> packets;
+static int is_stop;
+static std::vector<std::string> streams;
+static std::string rtsp_config;
+
+static std::vector<Stream_Context> _s_sc;
+
+extern "C"
+int rtsp_main(int argc, char **argv, AVCodecContext *ctx_src, const char *config_str);
+
+extern "C"
+int pickup_pkt(AVPacket *pkt, int *stop)
+{
+    if (!pkt) {
+        LOG_WARN("invalied paramter when pick packet");
+        return -1;
+    }
+
+    av_init_packet(pkt);
+    pkt->data = NULL;
+    pkt->size = 0;
+
+    AVPacket *tmp = NULL;
+
+    int total;
+
+    pthread_mutex_lock(&mutex);
+
+    if (is_stop) {
+        *stop = 1;
+        pthread_mutex_unlock(&mutex);
+        return -EAGAIN;
+    } else {
+        *stop = 0;
+    }
+
+    total = packets.size();
+    if (total <= 0) {
+        pthread_mutex_unlock(&mutex);
+        return -EAGAIN;
+    }
+    tmp = packets.front();
+    packets.pop_front();
+
+    pthread_mutex_unlock(&mutex);
+
+    av_copy_packet(pkt, tmp);
+    av_free_packet(tmp);
+    free(tmp);
+
+    LOG_INFO("pickup success, total %d", total - 1);
+
+    return 0;
+}
+
+static int insert_pkt(AVPacket *pkt, int *stop) {
+    if (!pkt) {
+        LOG_WARN("insert packet failed");
+        return -1;
+    }
+
+    AVPacket *new_pkt = NULL;
+    new_pkt = (AVPacket*)malloc(sizeof(AVPacket));
+    if (!new_pkt) {
+        LOG_ERROR("insert packet failed: allocate new packet failed: %s", strerror(errno));
+        return -1;
+    }
+
+    av_init_packet(new_pkt);
+    new_pkt->data = NULL;
+    new_pkt->size = 0;
+    av_copy_packet(new_pkt, pkt);
+
+    int total;
+
+    pthread_mutex_lock(&mutex);
+
+    if (is_stop) {
+        *stop = 1;
+        pthread_mutex_unlock(&mutex);
+        av_free_packet(new_pkt);
+        free(new_pkt);
+        return -1;
+    } else {
+        *stop = 0;
+    }
+
+    total = packets.size();
+    if (total >= DEQUE_MAX_SIZE) {
+        pthread_mutex_unlock(&mutex);
+        av_free_packet(new_pkt);
+        LOG_WARN("deque full, insert failed");
+        return -1;
+    }
+    packets.push_back(new_pkt);
+
+    pthread_mutex_unlock(&mutex);
+
+    LOG_INFO("insert success, total %d", total + 1);
+
+    return 0;
+}
+
+extern "C"
+void stop_and_clear()
+{
+    pthread_mutex_lock(&mutex);
+
+    is_stop = 1;
+    packets.clear();
+
+    pthread_mutex_unlock(&mutex);
+
+    LOG_INFO("cleared packets buffer");
+}
+
+/*
+int stream_process(char *filename)
+{
+    int ret = 0;
+
+    memset(temp_file, 0, 1024);
+    snprintf(temp_file, 1024, "tmp/temp_%d.avi", getpid());
+
+    AVFormatContext *ifmt_ctx = NULL;
+    AVFormatContext *ofmt_ctx = NULL;
+
+    ret = open_input_file(&ifmt_ctx, filename);
+    if (ret != 0) {
+        avformat_network_deinit();
+        return 1;
+    }
+
+    ret = open_temp_file(ifmt_ctx, &ofmt_ctx, temp_file);
+    if (ret != 0) {
+        avformat_close_input(&ifmt_ctx);
+        avformat_network_deinit();
+        return 1;
+    }
+
+    int (*dec_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
+    int (*enc_func)(AVCodecContext *, AVPacket *, const AVFrame *, int *);
+    dec_func = NULL;
+    enc_func = NULL;
+
+    AVFrame *frame = NULL;
+    frame = av_frame_alloc();
+    if (!frame) {
+        LOG_ERROR("alloc frame failed for %s: %s", filename, av_err2str(ret));
+        avformat_close_input(&ifmt_ctx);
+        avformat_close_input(&ofmt_ctx);
+        avformat_network_deinit();
+        return 1;
+    }
+
+    AVPacket pkt;
+    av_init_packet(&pkt);
+    pkt.data = NULL;
+    pkt.size = 0;
+
+    int64_t tt = 0;
+    int got_frame = 0;
+    int stream_index = 0;
+    int read_error_counter = 0;
+    while (1) {
+        ret = av_read_frame(ifmt_ctx, &pkt);
+        if (ret < 0) {
+            if (read_error_counter++ < 10) {
+                msleep(100);
+                continue;
+            } else {
+                break;
+            }
+        }
+        read_error_counter = 0;
+        stream_index = pkt.stream_index;
+        enum AVMediaType type = ifmt_ctx->streams[stream_index]->codec->codec_type;
+        //TODO drop audio packet
+        if (stream_index != want_video_stream_index) {
+            continue;
+        }
+
+        av_packet_rescale_ts(&pkt, ifmt_ctx->streams[stream_index]->time_base,
+                ifmt_ctx->streams[stream_index]->codec->time_base);
+
+        dec_func = (type == AVMEDIA_TYPE_VIDEO) ? avcodec_decode_video2 : avcodec_decode_audio4;
+        enc_func = (type == AVMEDIA_TYPE_VIDEO) ? avcodec_encode_video2 : avcodec_encode_audio2;
+
+        do {
+            got_frame = 0;
+            ret = dec_func(ifmt_ctx->streams[stream_index]->codec, frame, &got_frame, &pkt);
+            if (ret < 0) {
+                LOG_ERROR("decode packet failed for %s: %s", filename, av_err2str(ret));
+                avformat_close_input(&ifmt_ctx);
+                avformat_close_input(&ofmt_ctx);
+                avformat_network_deinit();
+                return 1;
+            }
+            pkt.data += ret;
+            pkt.size -= ret;
+        } while (pkt.size > 0);
+        if (got_frame) {
+            if (frame->pts == AV_NOPTS_VALUE) {
+                frame->pts = tt++;
+            } else {
+                frame->pts = av_frame_get_best_effort_timestamp(frame);
+            }
+
+            if (type == AVMEDIA_TYPE_VIDEO) {
+                fun(frame, ifmt_ctx->streams[stream_index]->codec->pix_fmt);
+                if (need_delive_pkt) {
+                    ret = add_to_show_stream(ofmt_ctx->streams[stream_index]->codec, frame, enc_func, pkt.pts, pkt.duration);
+                    if (ret != 0) {
+                        LOG_ERROR("failed adding frame to show stream");
+                    }
+                }
+            }
+
+            av_frame_unref(frame);
+        }
+        av_frame_unref(frame);
+        av_free_packet(&pkt);
+        continue;
+    }
+
+    return 0;
+}
+*/
+
+void* rtsp_serv(void* arg)
+{
+    rtsp_main(0, NULL, (AVCodecContext*)arg, rtsp_config.c_str());
+    return NULL;
+}
+
+int get_rtsp_config(Json::Value config, std::string &rtsp_config)
+{
+    std::map<std::string, std::string> stream;
+    Json::Value::Members::iterator iter;
+    Json::Value::Members members;
+
+    if (!config.isMember("RTSPPort") || !config.isMember("RTSPBindAddress") || !config.isMember("Streams")) {
+        LOG_ERROR("not found item named 'RTSPPort' or 'RTSPBindAddress' or 'Streams' in rtsp_config");
+        return 1;
+    } else {
+        if (!config["RTSPPort"].isString() || !config["RTSPBindAddress"].isString()) {
+            LOG_ERROR("item 'RTSPPort' or 'RTSPBindAddress' is not a string");
+            return 1;
+        }
+        if (!config["Streams"].isObject()) {
+            LOG_ERROR("item 'Streams' is not an object");
+            return 1;
+        }
+    }
+
+    rtsp_config = "";
+
+    members = config.getMemberNames();
+    for (iter = members.begin(); iter != members.end(); iter++) {
+        if (*iter == "Streams") {
+            continue;
+        } else {
+            if (config[*iter].isString()) {
+                rtsp_config += *iter + " " + config[*iter].asString() + "\n";
+            }
+        }
+    }
+    if (config.isMember("Streams")) {
+        if (config["Streams"].isObject()) {
+            Json::Value streams = config["Streams"];
+            Json::Value::Members streams_mb;
+            Json::Value::Members::iterator streams_iter;
+            streams_mb = streams.getMemberNames();
+
+            for (streams_iter = streams_mb.begin(); streams_iter != streams_mb.end();
+                    streams_iter++) {
+                Json::Value stream = streams[*streams_iter];
+                if (stream.empty()) {
+                    continue;
+                }
+                if (stream.isObject()) {
+                    Json::Value::Members stream_mb;
+                    Json::Value::Members::iterator stream_iter;
+                    stream_mb = stream.getMemberNames();
+                    std::string stream_val = "";
+                    for (stream_iter = stream_mb.begin(); stream_iter != stream_mb.end();
+                            stream_iter++) {
+                        if (stream[*stream_iter].isString()) {
+                            stream_val += *stream_iter + " " + stream[*stream_iter].asString() + "\n";
+                        }
+                    }
+                    if (stream_val != "") {
+                        rtsp_config += "<Stream " + *streams_iter + ">\n" + stream_val + "</Stream>\n";
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int set_env(char *config_file)
+{
+    unsigned int streams_count = 0;
+    char *buf = NULL;
+    FILE *fd = NULL;
+    int ret = 0;
+
+    Json::Reader reader;
+    Json::Value config;
+    Json::Value empty;
+
+    struct stat sb;
+    if (stat("log", &sb) == -1) {
+        if (mkdir("log", 0755) < 0) {
+            fprintf(stderr, "[main] mkdir log failed\n");
+            return -1;
+        }
+    } else {
+        if ((sb.st_mode & S_IFMT) != S_IFDIR) {
+            if (unlink("log") != 0) {
+                fprintf(stderr, "[main] ./log need to be a directory, but not, and rm failed\n");
+                return -1;
+            }
+        }
+    }
+
+    memset(&sb, 0, sizeof(struct stat));
+    if (stat(config_file, &sb) == -1) {
+        fprintf(stderr, "cannot stat file %s: %s\n", config_file, strerror(errno));
+        return -1;
+    } else {
+        if ((sb.st_mode & S_IFMT) != S_IFREG) {
+            fprintf(stderr, "%s is not a regular file\n", config_file);
+            return -1;
+        }
+    }
+
+    fd = fopen(config_file, "r");
+    if (!fd) {
+        fprintf(stderr, "open configure file failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    buf = (char*)calloc(sb.st_size + 1, 1);
+    if (!buf) {
+        fprintf(stderr, "calloc failed: %s\n", strerror(errno));
+        fclose(fd);
+        return -1;
+    }
+
+    ret = 0;
+    while (!feof(fd)) {
+        ret = fread(&buf[ret], 1, sb.st_size - ret, fd);
+        if (ferror(fd)) {
+            fprintf(stderr, "something error when reading configure file: %s\n", strerror(errno));
+            fclose(fd);
+            free(buf);
+            return -1;
+        }
+    }
+
+    if (!reader.parse(buf, config)) {
+        fprintf(stderr, "the configure file is not in a valid json format\n");
+        fclose(fd);
+        free(buf);
+        return -1;
+    }
+    fclose(fd);
+    free(buf);
+
+    if (!config.isMember("log_file")) {
+        fprintf(stderr, "not found config item 'log_file'\n");
+        return -1;
+    } else {
+        if (!config["log_file"].isString()) {
+            fprintf(stderr, "config item 'log_file' is not a string\n");
+            return -1;
+        }
+    }
+    if (!config.isMember("log_leave")) {
+        fprintf(stderr, "not found config item 'log_leave'\n");
+        return -1;
+    } else {
+        if (!config["log_leave"].isInt()) {
+            fprintf(stderr, "config item 'log_leave' is not a integer\n");
+            return -1;
+        }
+    }
+
+    if (my_log_init(".", config["log_file"].asString().c_str(),
+                (config["log_file"].asString() + ".we").c_str(),
+                config["log_leave"].asInt()) < 0) {
+        fprintf(stderr, "my_log_init failed: %s\n", strerror(errno));
+        unlink(config["log_file"].asString().c_str());
+        unlink((config["log_file"].asString() + ".we").c_str());
+        //unlink("log");
+        return -1;
+    }
+
+    if (!freopen("/dev/null", "r", stdin)) {
+        LOG_ERROR("failed to redirect STDIN to /dev/null");
+        my_log_close();
+        return -1;
+    }
+    if (!freopen((config["log_file"].asString() + ".stdout").c_str(), "w", stdout)) {
+        LOG_ERROR("failed to redirect STDIN to %s",
+                (config["log_file"].asString() + ".stdout").c_str());
+        my_log_close();
+        return -1;
+    }
+    if (!freopen((config["log_file"].asString() + ".stderr").c_str(), "w", stderr)) {
+        LOG_ERROR("failed to redirect STDIN to %s",
+                (config["log_file"].asString() + ".stderr").c_str());
+        my_log_close();
+        return -1;
+    }
+
+    if (!config.isMember("streams")) {
+        LOG_ERROR("there is no item named 'streams' in configure file");
+        my_log_close();
+        return -1;
+    }
+    if (!config["streams"].isArray()) {
+        LOG_ERROR("the item 'streams' is not a array");
+        my_log_close();
+        return -1;
+    }
+
+    streams_count = config["streams"].size();
+    while (streams_count--) {
+        Json::Value temp = config["streams"].get(streams_count, empty);
+        if (temp.empty()) {
+            continue;
+        }
+        if (temp.isString()) {
+            streams.push_back(temp.asString());
+        } else {
+            LOG_WARN("the %dth item of 'streams' is not a string", streams_count + 1);
+        }
+    }
+
+    if (streams.size() == 0) {
+        LOG_WARN("no stream found yet");
+    }
+
+    if (!config.isMember("port")) {
+        LOG_ERROR("there is no item named 'port' in configure file");
+        my_log_close();
+        return -1;
+    }
+    if (!config["port"].isInt()) {
+        LOG_ERROR("the item 'port' is not a integer");
+        my_log_close();
+        return -1;
+    }
+
+    if (!config.isMember("rtsp_config")) {
+        LOG_ERROR("there is no item named 'rtsp_config' in configure file");
+        my_log_close();
+        return -1;
+    }
+    if (!config["rtsp_config"].isObject()) {
+        LOG_ERROR("the item 'port' is not an object");
+        my_log_close();
+        return -1;
+    }
+    if (get_rtsp_config(config["rtsp_config"], rtsp_config) != 0) {
+        LOG_ERROR("get rtsp config failed");
+        my_log_close();
+        return -1;
+    }
+
+    return 0;
+}
+
+int init_rtsp_server(pthread_t *rtsp_thread, int rtsp_width, int rtsp_height,
+        AVFrame **p_frame, AVCodecContext **p_ctx)
+{
+    int ret = 0;
+
+    enum AVCodecID codec_id = AV_CODEC_ID_MPEG4;
+
+    AVCodecContext *ctx = NULL;
+    AVCodec *codec = NULL;
+    AVFrame *frame = NULL;
+
+    codec = avcodec_find_encoder(codec_id);
+    if (!codec) {
+        LOG_ERROR("canot find encoder: %s", avcodec_get_name(codec_id));
+        return -1;
+    }
+
+    ctx = avcodec_alloc_context3(codec);
+    if (!ctx) {
+        LOG_ERROR("could not allocate codec context for %s", avcodec_get_name(codec_id));
+        return -1;
+    }
+
+    /*
+    ctx->bit_rate = 40000000;
+    ctx->width = rtsp_width;
+    ctx->height = rtsp_height;
+    ctx->request_sample_fmt = AV_SAMPLE_FMT_NONE;
+    ctx->bits_per_coded_sample = 24;
+    ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    ctx->time_base = (AVRational){1, 30};
+    ctx->gop_size = 10;
+    ctx->max_b_frames = 0;
+    */
+    ctx->bit_rate = BIT_RATE;
+    ctx->width = RTSP_WIDTH;
+    ctx->height = RTSP_HEIGHT;
+    ctx->request_sample_fmt = REQUEST_SAMPLE_FMT;
+    ctx->bits_per_coded_sample = BITS_PER_CODED_SAMPLE;
+    ctx->pix_fmt = PIX_FMT;
+    ctx->time_base = TIME_BASE;
+    ctx->gop_size = GOP_SIZE;
+    ctx->max_b_frames = MAX_B_FRAMES;
+
+    ret = avcodec_open2(ctx, codec, NULL);  // not thread safe
+    if (ret <  0) {
+        LOG_ERROR("open codec failed: %s\n", av_err2str(ret));
+        avcodec_free_context(&ctx);
+        av_free(ctx);
+        return -1;
+    }
+
+    frame = av_frame_alloc();
+    if (!frame) {
+        LOG_ERROR("allocating frame failed\n");
+        avcodec_free_context(&ctx);
+        av_free(ctx);
+        return -1;
+    }
+
+    frame->format = ctx->pix_fmt;
+    frame->height = rtsp_height;
+    frame->width = rtsp_width;
+
+    ret = av_image_alloc(frame->data, frame->linesize, frame->width, frame->height, ctx->pix_fmt, 32);
+    if (ret < 0) {
+        LOG_ERROR("allocating image failed: %s\n", av_err2str(ret));
+        av_freep(&frame->data[0]);
+        av_frame_free(&frame);
+        avcodec_close(ctx);
+        avcodec_free_context(&ctx);
+        av_free(ctx);
+        return -1;
+    }
+
+    ret = pthread_create(rtsp_thread, NULL, rtsp_serv, ctx);
+    if (ret != 0) {
+        LOG_ERROR("creating rtsp server thread failed");
+        av_freep(&frame->data[0]);
+        av_frame_free(&frame);
+        avcodec_close(ctx);
+        avcodec_free_context(&ctx);
+        av_free(ctx);
+        return -1;
+    }
+
+    *p_frame = frame;
+    *p_ctx = ctx;
+
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    int ret = 0;
+    int c = 0;
+    char *config_file = NULL;
+
+    while ((c = getopt(argc, argv, "f:")) != EOF) {
+        switch (c) {
+        case 'f':
+            config_file = optarg;
+            break;
+        case '?':
+            fprintf(stderr, "Usage: %s -f config_file\n", argv[0]);
+            return 1;
+        }
+    }
+
+    if (!config_file) {
+        fprintf(stderr, "Usage: %s -f config_file\n", argv[0]);
+        return 1;
+    }
+
+    ret = set_env(config_file);
+    if (ret < 0) {
+        fprintf(stderr, "set env failed\n");
+        return 1;
+    }
+
+    av_register_all();
+    avcodec_register_all();
+    avformat_network_init();
+
+    int rtsp_width = 1900;
+    int rtsp_height = 1040;
+
+    AVCodecContext *ctx = NULL;
+    AVFrame *frame = NULL;
+
+    pthread_t rtsp_thread;
+    ret = init_rtsp_server(&rtsp_thread, rtsp_width, rtsp_height, &frame, &ctx);
+    if ((ret < 0)) {
+        LOG_ERROR("initialising rtsp server failed");
+        return 1;;
+    }
+
+    AVPacket pkt;
+    av_init_packet(&pkt);
+    pkt.data = NULL;
+    pkt.size = 0;
+
+    int i, y, x, is_stop;
+    for (i = 0; 1; i++) {
+        /* Y */
+        for (y = 0; y < rtsp_height; y++) {
+            for (x = 0; x < rtsp_width; x++) {
+                //frame->data[0][y * frame->linesize[0] + x] = x + y + i * 3;
+                frame->data[0][y * frame->linesize[0] + x] = ((i / 30) % 2) * 255;
+            }
+        }
+        /* Cb and Cr */
+        for (y = 0; y < rtsp_height/2; y++) {
+            for (x = 0; x < rtsp_width/2; x++) {
+                //frame->data[1][y * frame->linesize[1] + x] = 128 + y + i * 2;
+                //frame->data[2][y * frame->linesize[2] + x] = 64 + x + i * 5;
+                frame->data[1][y * frame->linesize[1] + x] = ((i / 30) % 2) * 255;
+                frame->data[2][y * frame->linesize[2] + x] = ((i / 30) % 2) * 255;
+            }
+        }
+        frame->pts = i;
+
+        int got_output = 0;
+        ret = avcodec_encode_video2(ctx, &pkt, frame, &got_output);
+        if (ret < 0) {
+            LOG_WARN("encoding frame failed: %s\n", av_err2str(ret));
+            continue;
+        }
+
+        if (!got_output) {
+            continue;
+        }
+
+        ret = insert_pkt(&pkt, &is_stop);
+        if (ret < 0) {
+            if (is_stop) {
+                break;  //TODO
+            }
+            LOG_WARN("drop 1 packet");
+        }
+
+        av_free_packet(&pkt);
+    }
+
+    pthread_join(rtsp_thread, NULL);
+
+    if (frame) {
+        av_freep(&frame->data[0]);
+        av_frame_free(&frame);
+    }
+
+    if (ctx) {
+        avcodec_close(ctx);
+        avcodec_free_context(&ctx);
+        av_free(ctx);
+    }
+    
+    avformat_network_deinit();
+
+    return 0;
+}

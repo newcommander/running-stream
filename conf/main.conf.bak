@@ -1,0 +1,32 @@
+{
+    "log_file" : "log/main.log",
+    "log_leave" : 16,
+    "port" : 8888,
+    "streams" : [
+        "http://live3.tdm.com.mo:1935/tv/ch1.live/playlist.m3u8",
+        "rtmp://lxrtmp.load.cdn.zhanqi.tv/zqlive/2869_tUPFz",
+        "http://192.168.1.5:8080/video.rm",
+        "http://live.3gv.ifeng.com/zixun800k.m3u8",
+        "http://live.3gv.ifeng.com/hongkong800k.m3u8"
+    ],
+    "rtsp_config" : {
+        "RTSPPort" : "9090",
+        "RTSPBindAddress" : "0.0.0.0",
+        "MaxClients" : "1000",
+        "MaxBandwidth" : "5000",
+        "CustomLog" : "-",
+
+        "Streams" : {
+            "video.rm" : {
+                "Format" : "rtp",
+                "File" : "get.avi",
+                "VideoFrameRate" : "30",
+                "VideoBitRate" : "256",
+                "VideoBufferSize" : "4000",
+                "VideoGopSize" : "0",
+                "StartSendOnKey" : "",
+                "NoAudio" : ""
+            }
+        }
+    }
+}

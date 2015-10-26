@@ -1,2 +1,2 @@
 # running-stream
-video streaming server
+video streaming server, analysing mutil video source online
